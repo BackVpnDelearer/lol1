@@ -1,54 +1,77 @@
-import socket
+import asyncio
+import websockets
+import os
+import http.server
 import threading
 
-PORT = 65432
+# Render сам выдает порт через переменную среды, если ее нет — ставим 10000
+PORT = int(os.environ.get("PORT", 10000))
+
 admin_conn = None
 client_conn = None
 
-def handle_connection(conn, addr):
+# --- КОСТЫЛЬ ДЛЯ ОБХОДА ТАЙМ-АУТА RENDER ---
+def run_dummy_http():
+    """Запускает простейший веб-сервер, чтобы Render думал, что это сайт"""
+    server_address = ('0.0.0.0', PORT)
+    # Создаем заглушку, которая на любой запрос отвечает кодом 200 OK
+    class SimpleHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b"OK")
+        def log_message(self, format, *args):
+            return # Отключаем лишние логи в консоль
+            
+    httpd = http.server.HTTPServer(server_address, SimpleHandler)
+    print(f"[*] HTTP-заглушка запущена на порту {PORT}")
+    httpd.serve_forever()
+
+async def handle_connection(websocket, path):
     global admin_conn, client_conn
     try:
-        conn.settimeout(5.0)
-        auth_data = conn.recv(1024).decode('utf-8').strip()
-        conn.settimeout(None)
+        auth_data = await websocket.recv()
+        auth_data = auth_data.strip()
         
         if auth_data == "IAM_ADMIN":
-            admin_conn = conn
-            print(f"[+] Пульт управления подключен! IP: {addr}")
-            while True:
-                data = conn.recv(4096)
-                if not data: break
-                if client_conn:
-                    client_conn.sendall(data)
-                else:
-                    conn.sendall(b"error:Klient seychas vne seti!")
-                    
+            admin_conn = websocket
+            print("[+] Пульт управления подключен!")
+            try:
+                async for message in websocket:
+                    if client_conn:
+                        await client_conn.send(message)
+                    else:
+                        await websocket.send("error:Klient seychas vne seti!")
+            except:
+                pass
+            finally:
+                admin_conn = None
+                
         elif auth_data == "IAM_CLIENT":
-            client_conn = conn
-            print(f"[+] Управляемый ПК подключен! IP: {addr}")
-            while True:
-                data = conn.recv(65536)
-                if not data: break
-                if admin_conn:
-                    admin_conn.sendall(data)
-        else:
-            conn.close()
-            
+            client_conn = websocket
+            print("[+] Управляемый ПК подключен!")
+            try:
+                async for message in websocket:
+                    if admin_conn:
+                        await admin_conn.send(message)
+            except:
+                pass
+            finally:
+                client_conn = None
+                
     except Exception as e:
-        print(f"[-] Ошибка устройства {addr}: {e}")
-    finally:
-        if conn == admin_conn: admin_conn = None
-        elif conn == client_conn: client_conn = None
+        print(f"Ошибка сокета: {e}")
 
-def start_server():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(('0.0.0.0', PORT))
-        s.listen(5)
-        print(f"[*] Центральный сервер успешно запущен на порту {PORT}")
-        while True:
-            conn, addr = s.accept()
-            threading.Thread(target=handle_connection, args=(conn, addr), daemon=True).start()
+async def main():
+    # Запускаем HTTP-заглушку в отдельном потоке, чтобы она не мешала веб-сокетам
+    threading.Thread(target=run_dummy_http, daemon=True).start()
+    
+    # Запускаем наш основной сервер управления на том же порту
+    # Веб-сокеты умеют работать на одном порту вместе с HTTP
+    async with websockets.serve(handle_connection, "0.0.0.0", PORT):
+        print(f"[*] Облачный сервер управления готов.")
+        await asyncio.Future()
 
 if __name__ == "__main__":
-    start_server()
+    asyncio.run(main())
